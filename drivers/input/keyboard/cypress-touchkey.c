@@ -32,6 +32,10 @@
 #include <linux/miscdevice.h>
 #include <linux/input/cypress-touchkey.h>
 
+#ifdef CONFIG_GENERIC_BLN
+#include <linux/bln.h>
+#endif
+
 #define SCANCODE_MASK		0x07
 #define UPDOWN_EVENT_MASK	0x08
 #define ESD_STATE_MASK		0x10
@@ -43,16 +47,6 @@
 #define OLD_BACKLIGHT_OFF	0x2
 
 #define DEVICE_NAME "cypress-touchkey"
-
-#ifdef CONFIG_KEYPAD_CYPRESS_TOUCH_BLN
-#include <linux/miscdevice.h>
-#define BACKLIGHTNOTIFICATION_VERSION 8
-
-bool bln_enabled = false; // indicates if BLN function is enabled/allowed (default: false, app enables it on boot)
-bool bln_notification_ongoing= false; // indicates ongoing LED Notification
-bool bln_blink_enabled = false;	// indicates blink is set
-struct cypress_touchkey_devdata *bln_devdata; // keep a reference to the devdata
-#endif
 
 int bl_on = 0;
 static DEFINE_SEMAPHORE(enable_sem);
@@ -77,6 +71,10 @@ struct cypress_touchkey_devdata {
 	bool has_legacy_keycode;
 	bool is_sleeping;
 };
+
+#ifdef CONFIG_GENERIC_BLN
+static struct cypress_touchkey_devdata *blndevdata;
+#endif
 
 static int i2c_touchkey_read_byte(struct cypress_touchkey_devdata *devdata,
 					u8 *val)
@@ -250,9 +248,7 @@ static irqreturn_t touchkey_interrupt_thread(int irq, void *touchkey_devdata)
 	}
 
 	input_sync(devdata->input_dev);
-	
-	if (!bln_notification_ongoing)
-		bl_set_timeout();
+	bl_set_timeout();
 err:
 	return IRQ_HANDLED;
 }
@@ -321,26 +317,27 @@ static void cypress_touchkey_early_suspend(struct early_suspend *h)
 
 	devdata->is_powering_on = true;
 
-	if (unlikely(devdata->is_dead))
+	if (unlikely(devdata->is_dead)) {
 		goto out;
+	}
 
 	disable_irq(devdata->client->irq);
 
-#ifdef CONFIG_KEYPAD_CYPRESS_TOUCH_BLN
-	/*
-	 * Disallow powering off the touchkey controller
-	 * while a led notification is ongoing
-	 */
-	if (!bln_notification_ongoing)
-	{
-#endif
-	devdata->pdata->touchkey_onoff(TOUCHKEY_OFF);
-	devdata->pdata->touchkey_sleep_onoff(TOUCHKEY_OFF);
-	devdata->is_sleeping = true;
-#ifdef CONFIG_KEYPAD_CYPRESS_TOUCH_BLN
-	}
+#ifdef CONFIG_GENERIC_BLN
+  /*
+   * Disallow powering off the touchkey controller
+   * while a led notification is ongoing
+   */
+  if(!bln_is_ongoing()) {
+    devdata->pdata->touchkey_onoff(TOUCHKEY_OFF);
+    devdata->pdata->touchkey_sleep_onoff(TOUCHKEY_OFF);
+  }
+#else
+	if (!bl_on)
+		devdata->pdata->touchkey_onoff(TOUCHKEY_OFF);
 #endif
 	all_keys_up(devdata);
+	devdata->is_sleeping = true;
 
 out:
 	up(&enable_sem);
@@ -371,8 +368,7 @@ static void cypress_touchkey_early_resume(struct early_suspend *h)
 
 	up(&enable_sem);
 
-	if (!bln_notification_ongoing)
-		bl_set_timeout();
+	bl_set_timeout();
 }
 #endif
 
@@ -382,9 +378,6 @@ static ssize_t led_status_read(struct device *dev, struct device_attribute *attr
 
 static ssize_t led_status_write(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
 {
-	if (bln_notification_ongoing)
-		return size;
-	
 	unsigned int data;
 
 	if (sscanf(buf, "%u\n", &data)) {
@@ -424,179 +417,75 @@ static struct miscdevice bl_led_device = {
 		.name = "notification",
 };
 
-#ifdef CONFIG_KEYPAD_CYPRESS_TOUCH_BLN
-/* bln start */
-
+#ifdef CONFIG_GENERIC_BLN
 static void enable_touchkey_backlights(void){
-	i2c_touchkey_write_byte(bln_devdata, bln_devdata->backlight_on);
+       i2c_touchkey_write_byte(blndevdata, blndevdata->backlight_on);
 }
 
 static void disable_touchkey_backlights(void){
-	i2c_touchkey_write_byte(bln_devdata, bln_devdata->backlight_off);
+       i2c_touchkey_write_byte(blndevdata, blndevdata->backlight_off);
 }
 
-static void enable_led_notification(void){
-	if (bln_enabled){
-		/* is_powering_on signals whether touchkey lights are used for touchmode */
-		pr_info("%s: bln interface enabled\n", __FUNCTION__); //remove me
-		
-		if (bln_devdata->is_powering_on){
-		pr_info("%s: not in touchmode\n", __FUNCTION__); //remove me
-			/* signal ongoing led notification */
-			bln_notification_ongoing = true;
-			bln_devdata->pdata->touchkey_sleep_onoff(TOUCHKEY_ON);
-			/*
-			 * power on the touchkey controller
-			 * This is actually not needed, but it is intentionally
-			 * left for the case that the early_resume() function
-			 * did not power on the touchkey controller for some reasons
-			 */
-			pr_info("%s: enable vdd\n", __FUNCTION__); //remove me
-			bln_devdata->pdata->touchkey_onoff(TOUCHKEY_ON);
+static void cypress_touchkey_enable_led_notification(void){
+  /* is_powering_on signals whether touchkey lights are used for touchmode */
+  if (blndevdata->is_powering_on){
+    /* reconfigure gpio for sleep mode */
+    blndevdata->pdata->touchkey_sleep_onoff(TOUCHKEY_ON);
 
-			/* write to i2cbus, enable backlights */
-			pr_info("%s: enable lights\n", __FUNCTION__); //remove me
-			enable_touchkey_backlights();
+    /*
+     * power on the touchkey controller
+     * This is actually not needed, but it is intentionally
+     * left for the case that the early_resume() function
+     * did not power on the touchkey controller for some reasons
+     */
+    blndevdata->pdata->touchkey_onoff(TOUCHKEY_ON);
 
-			pr_info("%s: notification led enabled\n", __FUNCTION__);
-		}
-		else
-			pr_info("%s: cannot set notification led, touchkeys are enabled\n",__FUNCTION__);
-	}
-}
-
-static void disable_led_notification(void){
-	pr_info("%s: notification led disabled\n", __FUNCTION__);
-
-	bln_devdata->pdata->touchkey_sleep_onoff(TOUCHKEY_OFF);
-	/* disable the blink state */
-	bln_blink_enabled = false;
-
-	/* if touchkeys lights are not used for touchmode */
-	if (bln_devdata->is_powering_on){
-		disable_touchkey_backlights();
-	}
-
-	/* signal led notification is disabled */
-	bln_notification_ongoing = false;
-	
-	bl_set_timeout();
-}
-
-static ssize_t backlightnotification_status_read(struct device *dev, struct device_attribute *attr, char *buf) {
-    return sprintf(buf,"%u\n",(bln_enabled ? 1 : 0));
-}
-static ssize_t backlightnotification_status_write(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
-{
-	unsigned int data;
-	if(sscanf(buf, "%u\n", &data) == 1) {
-		pr_devel("%s: %u \n", __FUNCTION__, data);
-		if(data == 0 || data == 1){
-
-			if(data == 1){
-				pr_info("%s: backlightnotification function enabled\n", __FUNCTION__);
-				bln_enabled = true;
-			}
-
-			if(data == 0){
-				pr_info("%s: backlightnotification function disabled\n", __FUNCTION__);
-				bln_enabled = false;
-				if (bln_notification_ongoing)
-					disable_led_notification();
-			}
-		}
-		else
-			pr_info("%s: invalid input range %u\n", __FUNCTION__, data);
-	}
-	else
-		pr_info("%s: invalid input\n", __FUNCTION__);
-
-	return size;
-}
-
-static ssize_t notification_led_status_read(struct device *dev, struct device_attribute *attr, char *buf) {
-	return sprintf(buf,"%u\n", (bln_notification_ongoing ? 1 : 0));
-}
-
-static ssize_t notification_led_status_write(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
-{
-	unsigned int data;
-
-	if(sscanf(buf, "%u\n", &data) == 1) {
-		if(data == 0 || data == 1){
-			pr_devel("%s: %u \n", __FUNCTION__, data);
-			if (data == 1)
-				enable_led_notification();
-
-			if(data == 0)
-				disable_led_notification();
-
-		} else
-			pr_info("%s: wrong input %u\n", __FUNCTION__, data);
-	} else
-		pr_info("%s: input error\n", __FUNCTION__);
-
-	return size;
-}
-
-static ssize_t blink_control_read(struct device *dev, struct device_attribute *attr, char *buf) {
-	return sprintf(buf,"%u\n", (bln_blink_enabled ? 1 : 0));
-}
-
-static ssize_t blink_control_write(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
-{
-	unsigned int data;
-
-	if(sscanf(buf, "%u\n", &data) == 1) {
-		if(data == 0 || data == 1){
-			if (bln_notification_ongoing){
-				pr_devel("%s: %u \n", __FUNCTION__, data);
-				if (data == 1){
-					bln_blink_enabled = true;
-					disable_touchkey_backlights();
-				}
-
-				if(data == 0){
-					bln_blink_enabled = false;
-					enable_touchkey_backlights();
-				}
-			}
-
-		} else
-			pr_info("%s: wrong input %u\n", __FUNCTION__, data);
-	} else
-		pr_info("%s: input error\n", __FUNCTION__);
-
-	return size;
-}
-
-static ssize_t backlightnotification_version(struct device *dev, struct device_attribute *attr, char *buf) {
-	return sprintf(buf, "%u\n", BACKLIGHTNOTIFICATION_VERSION);
-}
-
-static DEVICE_ATTR(blink_control, S_IRUGO | S_IWUGO , blink_control_read, blink_control_write);
-static DEVICE_ATTR(enabled, S_IRUGO | S_IWUGO , backlightnotification_status_read, backlightnotification_status_write);
-static DEVICE_ATTR(notification_led, S_IRUGO | S_IWUGO , notification_led_status_read, notification_led_status_write);
-static DEVICE_ATTR(version, S_IRUGO , backlightnotification_version, NULL);
-
-static struct attribute *bln_interface_attributes[] = {
-		&dev_attr_blink_control.attr,
-		&dev_attr_enabled.attr,
-		&dev_attr_notification_led.attr,
-		&dev_attr_version.attr,
-		NULL
-};
-
-static struct attribute_group bln_interface_attributes_group = {
-		.attrs  = bln_interface_attributes,
-};
-
-static struct miscdevice backlightnotification_device = {
-		.minor = MISC_DYNAMIC_MINOR,
-		.name = "backlightnotification",
-};
-/* bln end */
+    /* write to i2cbus, enable backlights */
+    enable_touchkey_backlights();
+  }
+  else 
+#ifdef CONFIG_TOUCH_WAKE
+  {
+    enable_touchkey_backlights();
+  }
+#else
+  pr_info("%s: cannot set notification led, touchkeys are enabled\n",__FUNCTION__);
 #endif
+}
+
+static void cypress_touchkey_disable_led_notification(void){
+  /*
+   * reconfigure gpio for sleep mode, this has to be done
+   * independently from the power status
+   */
+  blndevdata->pdata->touchkey_sleep_onoff(TOUCHKEY_OFF);
+
+  /* if touchkeys lights are not used for touchmode */
+  if (blndevdata->is_powering_on){
+    disable_touchkey_backlights();
+
+    #if 0
+    /*
+     * power off the touchkey controller
+     * This is actually not needed, the early_suspend function
+     * should take care of powering off the touchkey controller
+     */
+    blndevdata->pdata->touchkey_onoff(TOUCHKEY_OFF);
+    #endif
+  }
+#ifdef CONFIG_TOUCH_WAKE
+  else {
+    disable_touchkey_backlights();
+  }
+#endif  
+}
+
+static struct bln_implementation cypress_touchkey_bln = {
+  .enable = cypress_touchkey_enable_led_notification,
+  .disable = cypress_touchkey_disable_led_notification,
+};
+#endif
+
 
 static int cypress_touchkey_probe(struct i2c_client *client,
 		const struct i2c_device_id *id)
@@ -709,6 +598,11 @@ static int cypress_touchkey_probe(struct i2c_client *client,
 
 	devdata->is_powering_on = false;
 
+#ifdef CONFIG_GENERIC_BLN
+  blndevdata = devdata;
+  register_bln_implementation(&cypress_touchkey_bln);
+#endif
+
 	if (misc_register(&bl_led_device))
 		printk("%s misc_register(%s) failed\n", __FUNCTION__, bl_led_device.name);
 	else {
@@ -718,26 +612,6 @@ static int cypress_touchkey_probe(struct i2c_client *client,
 
     bl_devdata = devdata;
 	setup_timer(&bl_timer, bl_timer_callback, 0);
-#ifdef CONFIG_KEYPAD_CYPRESS_TOUCH_BLN
-	pr_info("%s misc_register(%s)\n", __FUNCTION__, backlightnotification_device.name);
-	err = misc_register(&backlightnotification_device);
-	if (err) {
-		pr_err("%s misc_register(%s) fail\n", __FUNCTION__, backlightnotification_device.name);
-	}else {
-		/*
-		 *  keep a reference to the devdata,
-		 *  misc driver does not give access to it (or i missed that somewhere)
-		 */
-		bln_devdata = devdata;
-
-		/* add the backlightnotification attributes */
-		if (sysfs_create_group(&backlightnotification_device.this_device->kobj, &bln_interface_attributes_group) < 0)
-		{
-			pr_err("%s sysfs_create_group fail\n", __FUNCTION__);
-			pr_err("Failed to create sysfs group for device (%s)!\n", backlightnotification_device.name);
-		}
-	}
-#endif
 
 	return 0;
 
@@ -761,11 +635,6 @@ static int __devexit i2c_touchkey_remove(struct i2c_client *client)
 {
 	struct cypress_touchkey_devdata *devdata = i2c_get_clientdata(client);
 
-       
-#ifdef CONFIG_KEYPAD_CYPRESS_TOUCH_BLN
-       misc_deregister(&backlightnotification_device);
-#endif
-
 	dev_err(&client->dev, "%s: i2c_touchkey_remove\n", __func__);
 
 	misc_deregister(&bl_led_device);
@@ -781,7 +650,7 @@ static int __devexit i2c_touchkey_remove(struct i2c_client *client)
 	free_irq(client->irq, devdata);
 	all_keys_up(devdata);
 	input_unregister_device(devdata->input_dev);
-	del_timer(&bl_timer);
+    del_timer(&bl_timer);
 	kfree(devdata);
 	return 0;
 }
@@ -824,4 +693,3 @@ module_exit(touchkey_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("@@@");
 MODULE_DESCRIPTION("cypress touch keypad");
-

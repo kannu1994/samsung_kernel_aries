@@ -1,5 +1,5 @@
 #!/bin/bash
-
+export ANDROID_BUILD_TOP = ~/android/aosp
 setup ()
 {
     if [ x = "x$ANDROID_BUILD_TOP" ] ; then
