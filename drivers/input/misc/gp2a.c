@@ -34,6 +34,9 @@
 #include <linux/uaccess.h>
 #include <linux/gp2a.h>
 
+#ifdef CONFIG_TOUCH_WAKE
+#include <linux/touch_wake.h>
+#endif
 
 /* Note about power vs enable/disable:
  *  The chip has two functions, proximity and ambient light sensing.
@@ -360,6 +363,12 @@ irqreturn_t gp2a_irq_handler(int irq, void *data)
 	ip->val_state = val;
 	pr_err("gp2a: proximity val = %d\n", val);
 
+#ifdef CONFIG_TOUCH_WAKE
+    if (!val) {
+        proximity_detected();
+    }
+#endif
+
 	/* 0 is close, 1 is far */
 	input_report_abs(ip->proximity_input_dev, ABS_DISTANCE, val);
 	input_sync(ip->proximity_input_dev);
@@ -499,7 +508,7 @@ static int gp2a_i2c_probe(struct i2c_client *client,
 
 	/* hrtimer settings.  we poll for light values using a timer. */
 	hrtimer_init(&gp2a->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	gp2a->light_poll_delay = ns_to_ktime(200 * NSEC_PER_MSEC);
+	gp2a->light_poll_delay = ns_to_ktime(1000 * NSEC_PER_MSEC); // orig: 200
 	gp2a->timer.function = gp2a_timer_func;
 
 	/* the timer just fires off a work queue request.  we need a thread
