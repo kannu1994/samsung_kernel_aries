@@ -1,5 +1,5 @@
-#!/bin/bash
-export ANDROID_BUILD_TOP = ~/android/aosp
+#!/bin/bash -x
+export ANDROID_BUILD_TOP=~/android/aosp
 setup ()
 {
     if [ x = "x$ANDROID_BUILD_TOP" ] ; then
@@ -49,8 +49,8 @@ build ()
     mkdir -p "$target_dir/usr"
     cp "$KERNEL_DIR/usr/"*.list "$target_dir/usr"
     sed "s|usr/|$KERNEL_DIR/usr/|g" -i "$target_dir/usr/"*.list
-    make -C "$KERNEL_DIR" O="$target_dir" aries_${target}_defconfig HOSTCC="$CCACHE gcc"
-    make -C "$KERNEL_DIR" O="$target_dir" HOSTCC="$CCACHE gcc" CROSS_COMPILE="$CCACHE $CROSS_PREFIX" zImage modules
+    make -j4 -C "$KERNEL_DIR" O="$target_dir" aries_${target}_defconfig HOSTCC="$CCACHE gcc"
+    make -j4 -C "$KERNEL_DIR" O="$target_dir" HOSTCC="$CCACHE gcc" CROSS_COMPILE="$CCACHE $CROSS_PREFIX" zImage modules
     cp "$target_dir"/arch/arm/boot/zImage $ANDROID_BUILD_TOP/device/samsung/$target/kernel
     for module in "${MODULES[@]}" ; do
         cp "$target_dir/$module" $ANDROID_BUILD_TOP/device/samsung/$target
@@ -67,7 +67,7 @@ fi
 
 targets=("$@")
 if [ 0 = "${#targets[@]}" ] ; then
-    targets=(captivatemtd fascinatemtd galaxysmtd vibrantmtd)
+    targets=(galaxysmtd captivatemtd vibrantmtd fascinatemtd)
 fi
 
 START=$(date +%s)
